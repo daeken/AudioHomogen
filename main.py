@@ -1,5 +1,5 @@
 import os, os.path, subprocess, sys, tempfile
-import shutil
+import shutil, struct
 
 from pyparsedvd import load_vts_pgci
 import cueparser
@@ -12,6 +12,27 @@ def read_video_ifo(fn):
 	with open(fn, 'rb') as fp:
 		# noinspection PyTypeChecker
 		return load_vts_pgci(fp)
+
+def read_audio_ifo(fn):
+	tracktimes = []
+	with open(fn, 'rb') as fp:
+		fp.seek(0xCC, 0)
+		offset, = struct.unpack('>I', fp.read(4))
+		fp.seek(2048 * offset, 0)
+		numTitles, = struct.unpack('>H', fp.read(2))
+		assert numTitles == 1
+		fp.read(10)
+		titleOffset, = struct.unpack('>I', fp.read(4))
+		fp.seek(2048 * offset + titleOffset + 3, 0)
+		numTracks = fp.read(1)[0]
+		for i in range(numTracks):
+			fp.seek(2048 * offset + titleOffset + 0x10 + 20 * i, 0)
+			fp.read(4)
+			trackNum = fp.read(1)[0]
+			fp.read(1)
+			firstPts, ptsLen = struct.unpack('>II', fp.read(8))
+			tracktimes.append((firstPts / 90000, ptsLen / 90000))
+	return tracktimes
 
 def read_cue(fn):
 	with open(fn, 'rb') as fp:
@@ -91,7 +112,7 @@ def process_video_dvd(ipath, output):
 			start = end
 			continue
 		format_time = lambda x: '%02i:%02i:%02.3f' % (int(x / 60 / 60), int(x / 60 % 60), x % 60)
-		args = ['ffmpeg', '-i', combined, '-ss', format_time(start), '-to', format_time(end), '-map', '0:4', '-map', '-0:v', '-metadata', 'title=%s' % name, '-metadata', 'artist=%s' % artist_name, '-metadata', 'album=%s' % album_name, '%s/%i - %s.flac' % (output, i + 1, name), '-y']
+		args = ['ffmpeg', '-i', combined, '-ss', format_time(start), '-to', format_time(end), '-map', '0:%i' % before, '-map', '-0:v', '-metadata', 'title=%s' % name, '-metadata', 'artist=%s' % artist_name, '-metadata', 'album=%s' % album_name, '%s/%i - %s.flac' % (output, i + 1, name), '-y']
 		print(args)
 		procs.append(subprocess.Popen(args, stdout=subprocess.DEVNULL, stdin=subprocess.DEVNULL))
 		start = end
@@ -103,8 +124,8 @@ def process_video_dvd(ipath, output):
 
 def process_audio_dvd(ipath, output):
 	if len(glob('%s/*.AOB' % ipath)) == 0:
-		if os.path.exists(ipath + '/AUDEO_TS'):
-			return process_audio_dvd(ipath + '/AUDEO_TS', output)
+		if os.path.exists(ipath + '/AUDIO_TS'):
+			return process_audio_dvd(ipath + '/AUDIO_TS', output)
 		print('Presumed DVD but could not find AOB files.')
 		return 1
 
@@ -116,8 +137,7 @@ def process_audio_dvd(ipath, output):
 			titles[title] = 0
 		titles[title] += os.path.getsize(fn)
 	biggest = max(titles, key=titles.get)
-	ifo = read_video_ifo('%s/ATS_%s_0.IFO' % (ipath, biggest))
-	pc = ifo.program_chains[0]
+	track_ifo = read_audio_ifo('%s/ATS_%s_0.IFO' % (ipath, biggest))
 	aobs = sorted(glob('%s/ATS_%s_*.AOB' % (ipath, biggest)))
 	assert len(aobs) > 0
 	fsi = ffmpeg.probe(aobs[0])['streams']
@@ -138,13 +158,13 @@ def process_audio_dvd(ipath, output):
 		if input('"%s" by %s. Is this correct? y/n: ' % (album_name, artist_name)) == 'y':
 			break
 
+	format_time = lambda x: '%02i:%02i:%02.3f' % (int(x / 60 / 60), int(x / 60 % 60), x % 60) if x / 60 / 60 >= 1 else '%02i:%02.3f' % (int(x / 60), x % 60)
+
 	while True:
 		print('Please enter the track names. If you wish to discard a track, simply hit enter.')
 		track_names = []
-		for i, pt in enumerate(pc.playback_times):
-			name = input('Track %i (%s) name: ' % (i + 1, '%02i:%02i:%02i' % (
-			pt.hours, pt.minutes, pt.seconds) if pt.hours != 0 else '%02i:%02i.%03i' % (
-			pt.minutes, pt.seconds, int(pt.frames / 30 * 1000))))
+		for i, (start, length) in enumerate(track_ifo):
+			name = input('Track %i (%s) name: ' % (i + 1, format_time(length)))
 			track_names.append(None if name == '' else name)
 		print('Confirm:')
 		for i, name in enumerate(track_names):
@@ -162,21 +182,16 @@ def process_audio_dvd(ipath, output):
 			with open(elem, 'rb') as ifp:
 				ofp.write(ifp.read())
 
-	start = 0
 	procs = []
-	for i, elem in enumerate(pc.playback_times):
-		end = start + (elem.hours * 60 * 60 + elem.minutes * 60 + elem.seconds + elem.frames / 30)
+	for i, (start, length) in enumerate(track_ifo):
 		name = track_names[i]
 		if name is None:
-			start = end
 			continue
-		format_time = lambda x: '%02i:%02i:%02.3f' % (int(x / 60 / 60), int(x / 60 % 60), x % 60)
-		args = ['ffmpeg', '-i', combined, '-ss', format_time(start), '-to', format_time(end), '-map', '0:4', '-map',
+		args = ['ffmpeg', '-i', combined, '-ss', format_time(start), '-to', format_time(start + length), '-map', '0:%i' % before, '-map',
 				'-0:v', '-metadata', 'title=%s' % name, '-metadata', 'artist=%s' % artist_name, '-metadata',
 				'album=%s' % album_name, '%s/%i - %s.flac' % (output, i + 1, name), '-y']
 		print(args)
 		procs.append(subprocess.Popen(args, stdout=subprocess.DEVNULL, stdin=subprocess.DEVNULL))
-		start = end
 
 	for i, elem in enumerate(procs):
 		elem.wait()
@@ -217,6 +232,10 @@ def process_sacd(ipath, output):
 		print('Process', i, 'completed')
 	shutil.rmtree(dd)
 
+def process_mkv(ipath, output):
+	print('Unimplemented')
+	return 1
+
 def main(ipath, output):
 	if not os.path.exists(ipath):
 		print('Invalid path', ipath)
@@ -225,8 +244,8 @@ def main(ipath, output):
 	os.makedirs(output, exist_ok=True)
 	
 	if os.path.isdir(ipath):
-		#if len(glob('%s/*.AOB' % ipath)) != 0 or os.path.isdir(ipath + '/AUDIO_TS'):
-		#	return process_audio_dvd(ipath, output)
+		if len(glob('%s/*.AOB' % ipath)) != 0 or os.path.isdir(ipath + '/AUDIO_TS'):
+			return process_audio_dvd(ipath, output)
 		return process_video_dvd(ipath, output)
 
 	if ipath.endswith('.cue'):
