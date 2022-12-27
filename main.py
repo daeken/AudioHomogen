@@ -20,19 +20,31 @@ def read_audio_ifo(fn):
 		offset, = struct.unpack('>I', fp.read(4))
 		fp.seek(2048 * offset, 0)
 		numTitles, = struct.unpack('>H', fp.read(2))
-		assert numTitles == 1
-		fp.read(10)
-		titleOffset, = struct.unpack('>I', fp.read(4))
-		fp.seek(2048 * offset + titleOffset + 3, 0)
-		numTracks = fp.read(1)[0]
-		for i in range(numTracks):
-			fp.seek(2048 * offset + titleOffset + 0x10 + 20 * i, 0)
+		fp.read(6)
+		titleOffsets = []
+		for i in range(numTitles):
 			fp.read(4)
-			trackNum = fp.read(1)[0]
-			fp.read(1)
-			firstPts, ptsLen = struct.unpack('>II', fp.read(8))
-			tracktimes.append((firstPts / 90000, ptsLen / 90000))
+			titleOffset, = struct.unpack('>I', fp.read(4))
+			titleOffsets.append(titleOffset)
+		for j, titleOffset in enumerate(titleOffsets):
+			fp.seek(2048 * offset + titleOffset + 3, 0)
+			numTracks = fp.read(1)[0]
+			fp.read(10)
+			sectorOffset, = struct.unpack('>H', fp.read(2))
+			for i in range(numTracks):
+				fp.seek(2048 * offset + titleOffset + 0x10 + 20 * i, 0)
+				fp.read(4)
+				trackNum = fp.read(1)[0]
+				fp.read(1)
+				firstPts, ptsLen = struct.unpack('>II', fp.read(8))
+				fp.seek(2048 * offset + titleOffset + 0x10 + 20 * numTracks + i * 12 + 4, 0)
+				firstSector, lastSector = struct.unpack('>II', fp.read(8))
+				tracktimes.append((firstPts / 90000, ptsLen / 90000, firstSector, lastSector))
+			break
 	return tracktimes
+
+#pprint(read_audio_ifo('test.ifo'))
+#sys.exit(0)
 
 def read_cue(fn):
 	with open(fn, 'rb') as fp:
@@ -163,7 +175,7 @@ def process_audio_dvd(ipath, output):
 	while True:
 		print('Please enter the track names. If you wish to discard a track, simply hit enter.')
 		track_names = []
-		for i, (start, length) in enumerate(track_ifo):
+		for i, (_, length, _, _) in enumerate(track_ifo):
 			name = input('Track %i (%s) name: ' % (i + 1, format_time(length)))
 			track_names.append(None if name == '' else name)
 		print('Confirm:')
@@ -183,11 +195,11 @@ def process_audio_dvd(ipath, output):
 				ofp.write(ifp.read())
 
 	procs = []
-	for i, (start, length) in enumerate(track_ifo):
+	for i, (start, length, firstSector, lastSector) in enumerate(track_ifo):
 		name = track_names[i]
 		if name is None:
 			continue
-		args = ['ffmpeg', '-i', combined, '-ss', format_time(start), '-to', format_time(start + length), '-map', '0:%i' % before, '-map',
+		args = ['ffmpeg', '-skip_initial_bytes', str(firstSector * 2048), '-i', combined, '-t', format_time(length), '-map', '0:%i' % before, '-map',
 				'-0:v', '-metadata', 'title=%s' % name, '-metadata', 'artist=%s' % artist_name, '-metadata',
 				'album=%s' % album_name, '%s/%i - %s.flac' % (output, i + 1, name), '-y']
 		print(args)
